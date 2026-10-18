@@ -29,9 +29,11 @@ stage() {
 }
 stage "$REPO" "$T/new"
 # run <tree> <launcher> <env...>: argv on stdout (stub vllm), stderr in $T/err, exit code in $T/rc.
+# FA2_FP8KV=0: on a compute capability 8.6 host an unset knob resolves to 1 on SPEC=dflash2 CTX=long, and
+# the stub venv has no fa2 plugin, so that arm would refuse for a reason that has nothing to do with PTH_FA.
 run() { local tree=$1 sc=$2; shift 2
   (cd "$tree" && env -u PRINT_ARGV -u PTH_FA -u KV_OFFLOAD_GB -u EXTRA_ARGS -u SPEC -u CTX -u PYTORCH_CUDA_ALLOC_CONF \
-     -u WSL_DISTRO_NAME -u CUDA_HOME VLLM_API_KEY=k "$@" bash "$sc" 2>"$T/err" </dev/null); echo $? > "$T/rc"; }
+     -u WSL_DISTRO_NAME -u CUDA_HOME -u FA2_FP8KV VLLM_API_KEY=k FA2_FP8KV=0 "$@" bash "$sc" 2>"$T/err" </dev/null); echo $? > "$T/rc"; }
 rc() { cat "$T/rc"; }
 # after <flag>: the argument that follows <flag> in the argv on stdin ("none" if absent; every value if repeated).
 after() { local v; v=$(sed -n "/^$1\$/{n;p;}" | tr '\n' ' ' | sed 's/ $//'); echo "${v:-none}"; }
