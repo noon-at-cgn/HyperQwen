@@ -120,7 +120,8 @@ TRITON_ATTN --max-model-len 262144` (batch/start_qwen.sh: `KV=int4pth`).
 The block drafter was pinned to `CTX=fast` — bf16 KV on FlashAttention, 64k at
 `DFLASH_TOKENS=7` and 56k at 15 — because bf16 KV is 64 KB per token and the pinned
 5.2 GiB pool is exactly that much. `CTX=long` moves it to an `int8_per_token_head` cache
-on the Triton backend and roughly doubles the context:
+on the Triton backend (`FA2_FP8KV=0`; the default is now fp8 KV on FlashAttention-2, below) and
+roughly doubles the context:
 
 | | bf16 (`CTX=fast`) | int8 (`CTX=long`) |
 |---|---|---|
@@ -165,11 +166,30 @@ Two patches make that work, and neither changes anything at bf16:
   tracked separately): do not stack the two until the memory-pressure question behind it is
   understood.
 
+### fp8 KV on FlashAttention-2 (`FA2_FP8KV`, default on for the 3090)
+
+`SPEC=dflash2 CTX=long` runs on fp8 KV on `FLASH_ATTN` by default, with the fp8 kernels from the
+`fa2/` plugin (`bash fa2/install.sh` builds and installs it once, the Docker image has it, and the
+launcher refuses to start without it instead of falling back). `FA2_FP8KV=0` restores the int8 +
+Triton arm described above. The build targets sm86 only, so the default is on only when
+`nvidia-smi` reports compute capability 8.6 (an RTX 3090-class GPU); any other GPU, or no answer
+from `nvidia-smi`, resolves an unset knob to 0 with a note. The sm86 build also runs on sm89, and
+`FA2_FP8KV=1` opts in on a 4090 (unmeasured); on sm120 it fails at boot.
+The drafter also selects `FLASH_ATTN`, `SPEC_ATTN` does nothing on this arm (the plugin has its
+own split-KV verify), and `MAX_LEN` and `KV_MEM` keep the defaults above. An unset `FA2_FP8KV`
+resolves to 0, with a note, when `KV_OFFLOAD_GB` or a KV connector in `EXTRA_ARGS` is set: the
+plugin's backend supports only the LBNHC KV layout, vLLM's CPU-tier connector asks for LBHNC or
+BLHNC, and the CPU tier on this backend is untested, so the offload tier keeps int8 + Triton. An
+explicit `FA2_FP8KV=1` refuses that combination, and any other `SPEC` or `CTX`. The evidence is the
+T4 battery on the native 3090 ([#153](https://github.com/syv-ai/HyperQwen/issues/153)):
+on 2026-10-18 (bare metal, 250 W, vLLM 0.31.0) the fp8 + FA2 arm passed every bar against the shipped int8 + Triton arm: GSM8K 0.950 vs 0.955 (n=200), perplexity +0.04%, 0 of 128 residues broken, a 20-minute soak with no restart, decode 54.0 vs 48.2 tok/s at ~66k and 48.2 vs 37.9 tok/s at ~100k (+27%), cold TTFT 75.5 vs 132.3 s and 54.7 vs 130.5 s, and a 3.3% larger pool (140,902 vs 136,429 tokens).
+
 ### What it is actually good for
 
 Measured against the option that already covers this context, on 112,655-token prompts
 (`bench/labd_bench.py --ctx 100000 --corpus ~/bench/labd_corpus_long.txt`), both with
-`PREFIX_CACHE=1`:
+`PREFIX_CACHE=1`; the `SPEC=dflash2` column is the int8 + Triton arm (`FA2_FP8KV=0`), measured
+before the default changed:
 
 | task | `SPEC=dflash2 CTX=long` (k=15) | `SPEC=mtp CTX=long` |
 |---|---|---|
@@ -384,14 +404,19 @@ verify uncaptured — restored both the speed and the correctness on both machin
 
 `dflash2` has its FULL graphs back (`a75ee4b` fixed the residue, `b356e31` then
 swept **all 128** residues under FULL with 0 broken), so at HEAD
-`SPEC=dflash2 CTX=huge PREFIX_CACHE=1` runs captured. `SPEC=mtp CTX=huge`
+`SPEC=dflash2 CTX=huge PREFIX_CACHE=1` runs captured. `SPEC=mtp CTX=huge PREFIX_CACHE=1`
 still forces PIECEWISE, and that one is a correctness constraint rather than a
 preference: under FULL it breaks at one prompt length in 128 and nobody has
-fixed it. Either way prefix caching stays on, which is what the mode is for —
-turn 2 over a cached 100k document costs 4.7 s against 169 s cold.
+fixed it. Unset `PREFIX_CACHE` means 1, so unset gets PIECEWISE too. On 0.31 a sweep of
+all 128 residues found 0 broken at an 86% prefix-cache hit rate (2026-10-17), but it
+measured the path unset ran before the launcher passed the flag both ways (vLLM's
+default capture and caching, without the launcher's safeguards). It does not lift the
+pin. The pinned default path swept 0 of 128 broken on 0.31 as well (2026-10-17). In both
+cases prefix caching is on, which is what the mode is for — turn 2 over a
+cached 100k document costs 4.7 s against 169 s cold.
 
-`CUDAGRAPH_MODE=FULL_AND_PIECEWISE` overrides the MTP line for anyone hunting
-the root cause. Treat that as unsafe rather than merely slower.
+`CUDAGRAPH_MODE=FULL_AND_PIECEWISE` overrides the MTP `PREFIX_CACHE=1` line for anyone
+hunting the root cause. Treat that as unsafe rather than merely slower.
 
 What that trade costs, re-measured at HEAD. The numbers this README used to carry here
 had `FULL_AND_PIECEWISE` at 38 tok/s (1.97 per step) on the 25k copy task against
@@ -507,15 +532,15 @@ which caps `max_model_len` to 221,184 above 7 drafts rather than letting the ser
 to come up.
 
 
-The capture mode is fixed at boot, and for `SPEC=mtp CTX=huge` the trade is not
-optional. What FULL does there is corrupt one prompt length in every 128, and only
+The capture mode is fixed at boot, and for `SPEC=mtp CTX=huge PREFIX_CACHE=1` the trade
+is not optional. What FULL does there is corrupt one prompt length in every 128, and only
 for a request that hits the prefix cache. The broken residue is a function of the
 draft count (`R = 117 + k`, the same for both speculators), which is why scoping
 the workaround to `dflash2` was wrong the first time — `SPEC=mtp CTX=huge` shipped
 with the same bug at residue 4. Piecewise costs MTP nothing measurable
 (87.8/86.1/70.4/63.5 tok/s captured against 93.5/83.8/70.3/59.6 piecewise over
 8k-50k), so it keeps PIECEWISE until residue 4 comes back verbatim under a full
-sweep.
+sweep of that path.
 
 **Do not test that residue by its symptom.** The location is deterministic and the
 damage is not: the same `mtp` residue has returned an empty answer, a one-character

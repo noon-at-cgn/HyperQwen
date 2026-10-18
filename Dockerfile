@@ -31,6 +31,12 @@ RUN venv/bin/pip install -r docker/requirements.txt
 # pthfa/tests/gate_test.py against the pristine wheel; the RUN below runs it again on the patched tree.
 COPY pthfa/ pthfa/
 RUN PY=venv/bin/python bash pthfa/install.sh
+# The fp8-KV FA2 libraries (fa2/, optional, FA2_FP8KV=1) compile here, ahead of `COPY . .`, so an edit
+# elsewhere does not recompile them. git fetches CUTLASS at its pinned commit; the CUTLASS checkout and
+# the build tree go in the same layer's /tmp, which is removed, so only the two small .so files remain.
+COPY fa2/ fa2/
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/* \
+    && FA2_CACHE=/tmp/fa2-cache bash fa2/install.sh && rm -rf /tmp/fa2-cache
 
 COPY . .
 # patches/apply.sh reads the apply order from patches/series and applies it with --fuzz 0:
@@ -38,13 +44,16 @@ COPY . .
 # patches/*.patch is wrong.
 # bench/mq3d_scratch_pool_test.py imports the patched triton_attn.py and runs on CPU
 # tensors, so the build is where CI can run it. pthfa/tests/gate_test.py (the CUSTOM
-# backend's registration, inertness and limits against this vLLM) does the same.
+# backend's registration, inertness and limits against this vLLM), fa2/tests/gate_test.py (the
+# FA2_FP8KV gate) and check_mixed_prefill.py --device cpu (the adapter's routing) do the same.
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
     bash patches/apply.sh "$SP"; \
     bash kvarn/install.sh; \
     bash verify.sh --install; \
     venv/bin/python bench/mq3d_scratch_pool_test.py; \
-    CUDA_VISIBLE_DEVICES= venv/bin/python pthfa/tests/gate_test.py
+    CUDA_VISIBLE_DEVICES= venv/bin/python pthfa/tests/gate_test.py; \
+    venv/bin/python fa2/tests/gate_test.py; \
+    venv/bin/python fa2/tests/check_mixed_prefill.py --device cpu
 
 # HOME is a volume: torch.compile cache (~/.cache/vllm), Triton (~/.triton),
 # FlashInfer JIT (~/.cache/flashinfer), HF hub cache.
